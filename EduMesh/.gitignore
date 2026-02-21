@@ -1,0 +1,9 @@
+node_modules
+firebase.json
+main.exe
+.firebaserc
+.firebase*.exe
+*.db
+shared.key
+uploads/
+node_id.txt
