@@ -17,6 +17,13 @@ function toHex(buffer) {
 }
 
 async function sha256HexFromBuffer(buffer) {
+  if (
+    typeof crypto === "undefined" ||
+    !crypto.subtle ||
+    typeof crypto.subtle.digest !== "function"
+  ) {
+    return "";
+  }
   const digest = await crypto.subtle.digest("SHA-256", buffer);
   return toHex(digest);
 }
@@ -153,7 +160,11 @@ const Assignments = () => {
       setAnswers((prev) => ({ ...prev, [assignmentId]: "" }));
       setAnswerFiles((prev) => ({ ...prev, [assignmentId]: null }));
       setSubmitProgress(100);
-      setSubmitState("Submission uploaded in verified chunks.");
+      setSubmitState(
+        fileSha256
+          ? "Submission uploaded in verified chunks."
+          : "Submission uploaded. Checksum verification is limited on this browser."
+      );
       await refresh();
     } catch (e) {
       setSubmitState(e.message || "Submission failed.");
@@ -174,7 +185,7 @@ const Assignments = () => {
       const chunk = chunks[i];
       const bytes = base64ToUint8(chunk.data || "");
       const actual = await sha256HexFromBuffer(bytes.buffer);
-      if (actual !== String(chunk.hash || "").toLowerCase()) {
+      if (chunk.hash && actual !== String(chunk.hash || "").toLowerCase()) {
         setDownloadState(
           `Chunk ${i + 1}/${chunks.length} checksum failed. Download stopped.`
         );

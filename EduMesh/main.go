@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -8,6 +9,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"embed"
+	"encoding/ascii85"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -26,22 +28,30 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	_ "modernc.org/sqlite"
 )
 
 const (
-	dbName        = "local_user.db"
-	udpPort       = 9999
-	httpPort      = ":8080"
-	broadcastInt  = 30 * time.Second
-	syncInt       = 1 * time.Minute
-	uploadDir     = "./uploads"
-	chunkTempDir  = "./uploads/.chunks"
-	nodeIDFile    = "node_id.txt"
-	sharedKeyFile = "shared.key"
-	chunkSize     = 1024 * 1024
-	vcdSessionTTL = 10 * time.Minute
-	speedTestSize = 200 * 1024
+	dbName              = "local_user.db"
+	udpPort             = 9999
+	defaultHTTPPort     = ":8080"
+	broadcastInt        = 30 * time.Second
+	syncInt             = 1 * time.Minute
+	uploadDir           = "./uploads"
+	compressedDir       = "./uploads/.compressed"
+	chunkTempDir        = "./uploads/.chunks"
+	nodeIDFile          = "node_id.txt"
+	sharedKeyFile       = "shared.key"
+	chunkSize           = 1024 * 1024
+	vcdSessionTTL       = 10 * time.Minute
+	speedTestSize       = 200 * 1024
+	vcdArtifactDir      = "./uploads/vcd"
+	janitorInt          = 24 * time.Hour
+	storageSoftLimitPct = 90
+	smsPrefix           = "SchoolSync:"
+	smsPartTextLimit    = 130
+	smsRawChunkSize     = 96
 )
 
 var mu sync.Mutex
@@ -53,6 +63,7 @@ var nodeID string
 var sharedKey []byte
 var discoveryURL string
 var advertiseHost string
+var httpPort string
 var vcdShareMu sync.Mutex
 var vcdShare *VCDShareSession
 
@@ -82,11 +93,16 @@ type Post struct {
 }
 
 type FileMeta struct {
-	ID       string `json:"id"`
-	FileName string `json:"fileName"`
-	Size     int64  `json:"size"`
-	SHA256   string `json:"sha256"`
-	Path     string `json:"-"`
+	ID             string `json:"id"`
+	FileName       string `json:"fileName"`
+	Size           int64  `json:"size"`
+	RawSize        int64  `json:"rawSize"`
+	CompressedSize int64  `json:"compressedSize"`
+	Compression    string `json:"compression"`
+	SHA256         string `json:"sha256"`
+	Path           string `json:"-"`
+	CompressedPath string `json:"-"`
+	IsCached       bool   `json:"isCached"`
 }
 
 type UploadSession struct {
@@ -154,6 +170,24 @@ type ChunkOwner struct {
 	UpdatedAt  string `json:"updatedAt"`
 }
 
+type SMSPrepareRequest struct {
+	FileID    string `json:"fileId"`
+	FileName  string `json:"fileName"`
+	Text      string `json:"text"`
+	Target    string `json:"target"`
+	Compress  bool   `json:"compress"`
+	UseBase64 bool   `json:"useBase64"`
+}
+
+type SMSPrepareResponse struct {
+	TransferID  string   `json:"transferId"`
+	FileName    string   `json:"fileName"`
+	Parts       int      `json:"parts"`
+	Encoding    string   `json:"encoding"`
+	Compression string   `json:"compression"`
+	Messages    []string `json:"messages"`
+}
+
 type ExportPayload struct {
 	NodeID        string                 `json:"nodeId"`
 	Rooms         []Room                 `json:"rooms"`
@@ -196,10 +230,14 @@ func main() {
 	sharedKey = loadSharedKey()
 	discoveryURL = strings.TrimSpace(os.Getenv("RDE_DISCOVERY_URL"))
 	advertiseHost = strings.TrimSpace(os.Getenv("RDE_ADVERTISE_HOST"))
+	httpPort = resolveHTTPPort()
 	os.MkdirAll(uploadDir, os.ModePerm)
+	os.MkdirAll(compressedDir, os.ModePerm)
 	os.MkdirAll(chunkTempDir, os.ModePerm)
+	os.MkdirAll(vcdArtifactDir, os.ModePerm)
 	db := initDB()
 	defer db.Close()
+	go startStorageJanitor(db)
 
 	go startUDPListener(db)
 	go func() {
@@ -266,8 +304,14 @@ func main() {
 	http.HandleFunc("/membership", func(w http.ResponseWriter, r *http.Request) {
 		handleMembership(w, r, db)
 	})
+	http.HandleFunc("/members/list", func(w http.ResponseWriter, r *http.Request) {
+		handleListMembers(w, r, db)
+	})
 	http.HandleFunc("/room_stats", func(w http.ResponseWriter, r *http.Request) {
 		handleRoomStats(w, r, db)
+	})
+	http.HandleFunc("/classroom/delete", func(w http.ResponseWriter, r *http.Request) {
+		handleDeleteClassroom(w, r, db)
 	})
 	http.HandleFunc("/assignments/create", func(w http.ResponseWriter, r *http.Request) {
 		handleCreateAssignment(w, r, db)
@@ -290,10 +334,24 @@ func main() {
 	http.HandleFunc("/chunks/owners", func(w http.ResponseWriter, r *http.Request) {
 		handleChunkOwners(w, r, db)
 	})
+	http.HandleFunc("/sms/prepare", func(w http.ResponseWriter, r *http.Request) {
+		handleSMSPrepare(w, r, db)
+	})
+	http.HandleFunc("/sms/ingest", func(w http.ResponseWriter, r *http.Request) {
+		handleSMSIngest(w, r, db)
+	})
+	http.HandleFunc("/sms/status", func(w http.ResponseWriter, r *http.Request) {
+		handleSMSStatus(w, r, db)
+	})
+	http.HandleFunc("/sms/reassemble", func(w http.ResponseWriter, r *http.Request) {
+		handleSMSReassemble(w, r, db)
+	})
 	http.HandleFunc("/vcd/start", handleVCDStart)
+	http.HandleFunc("/vcd/upload-artifact", handleVCDUploadArtifact)
 	http.HandleFunc("/vcd/status", handleVCDStatus)
 	http.HandleFunc("/vcd/stop", handleVCDStop)
 	http.HandleFunc("/health", handleHealth)
+	http.HandleFunc("/network/info", handleNetworkInfo)
 	http.HandleFunc("/speed-test", handleSpeedTest)
 	http.HandleFunc("/export", func(w http.ResponseWriter, r *http.Request) {
 		handleExport(w, r, db)
@@ -401,6 +459,20 @@ func loadSharedKey() []byte {
 	return sum[:]
 }
 
+func resolveHTTPPort() string {
+	raw := strings.TrimSpace(os.Getenv("RDE_HTTP_PORT"))
+	if raw == "" {
+		return defaultHTTPPort
+	}
+	if strings.HasPrefix(raw, ":") {
+		return raw
+	}
+	if _, err := strconv.Atoi(raw); err == nil {
+		return ":" + raw
+	}
+	return defaultHTTPPort
+}
+
 func encryptJSON(payload []byte) (string, string, error) {
 	if len(sharedKey) == 0 {
 		return "", "", fmt.Errorf("shared key missing")
@@ -453,6 +525,25 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func handleNetworkInfo(w http.ResponseWriter, r *http.Request) {
+	host := strings.TrimSpace(advertiseHost)
+	if host == "" {
+		host = getLocalIP()
+	}
+	if host == "" {
+		host = "localhost"
+	}
+	port := strings.TrimPrefix(httpPort, ":")
+	if strings.TrimSpace(port) == "" {
+		port = "8080"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"host": host,
+		"port": port,
+	})
+}
+
 func handleSpeedTest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -495,21 +586,27 @@ func handleVCDStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	artifactPath := strings.TrimSpace(req.ArtifactPath)
-	var err error
 	if artifactPath == "" {
-		artifactPath, err = os.Executable()
-		if err != nil {
-			http.Error(w, "Unable to resolve executable path", http.StatusInternalServerError)
-			return
-		}
+		http.Error(w, "Artifact path is required.", http.StatusBadRequest)
+		return
 	}
+	artifactPath = filepath.Clean(artifactPath)
+
 	info, err := os.Stat(artifactPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "Artifact file not found. Check the artifact path.", http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "Unable to read artifact metadata", http.StatusInternalServerError)
 		return
 	}
 	if info.IsDir() {
-		http.Error(w, "Artifact path is invalid", http.StatusInternalServerError)
+		http.Error(w, "Artifact path is invalid", http.StatusBadRequest)
+		return
+	}
+	if info.Size() <= 0 {
+		http.Error(w, "Artifact file is empty", http.StatusBadRequest)
 		return
 	}
 
@@ -519,11 +616,16 @@ func handleVCDStart(w http.ResponseWriter, r *http.Request) {
 	}
 	token := makeRandomToken()
 	artifactName := filepath.Base(artifactPath)
+	contentType := mime.TypeByExtension(strings.ToLower(filepath.Ext(artifactName)))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
 
 	mux := http.NewServeMux()
 	serveArtifact := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", artifactName))
 		http.ServeFile(w, r, artifactPath)
 	}
@@ -612,6 +714,91 @@ func handleVCDStart(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(session)
+}
+
+func handleVCDUploadArtifact(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseMultipartForm(700 << 20); err != nil {
+		http.Error(w, "Invalid upload form", http.StatusBadRequest)
+		return
+	}
+
+	file, header, err := r.FormFile("artifact")
+	if err != nil {
+		http.Error(w, "artifact file is required", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	originalName := strings.TrimSpace(filepath.Base(header.Filename))
+	if originalName == "" {
+		http.Error(w, "Invalid file name", http.StatusBadRequest)
+		return
+	}
+
+	if err := os.MkdirAll(vcdArtifactDir, os.ModePerm); err != nil {
+		http.Error(w, "Unable to prepare upload directory", http.StatusInternalServerError)
+		return
+	}
+
+	safeName := sanitizeArtifactName(strings.TrimSuffix(originalName, filepath.Ext(originalName)))
+	if safeName == "" {
+		safeName = "artifact"
+	}
+	ext := strings.ToLower(filepath.Ext(originalName))
+	if strings.TrimSpace(ext) == "" {
+		ext = ".bin"
+	}
+	fileName := fmt.Sprintf("%d-%s-%s%s", time.Now().Unix(), makeRandomToken()[:8], safeName, ext)
+	dstPath := filepath.Join(vcdArtifactDir, fileName)
+
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		http.Error(w, "Unable to store artifact", http.StatusInternalServerError)
+		return
+	}
+	size, copyErr := io.Copy(dst, file)
+	closeErr := dst.Close()
+	if copyErr != nil || closeErr != nil {
+		_ = os.Remove(dstPath)
+		http.Error(w, "Unable to store artifact", http.StatusInternalServerError)
+		return
+	}
+	if size <= 0 {
+		_ = os.Remove(dstPath)
+		http.Error(w, "Uploaded artifact is empty", http.StatusBadRequest)
+		return
+	}
+
+	absPath, err := filepath.Abs(dstPath)
+	if err != nil {
+		absPath = dstPath
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"artifactPath": absPath,
+		"fileName":     originalName,
+		"size":         size,
+	})
+}
+
+func sanitizeArtifactName(name string) string {
+	clean := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '-'
+	}, strings.TrimSpace(name))
+	clean = strings.Trim(clean, "-_")
+	if clean == "" {
+		return ""
+	}
+	return clean
 }
 
 func handleVCDStatus(w http.ResponseWriter, r *http.Request) {
@@ -728,13 +915,17 @@ func handleFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 	switch action {
 	case "manifest":
+		_ = touchFileAccess(db, meta.ID, nil)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"id":        meta.ID,
-			"fileName":  meta.FileName,
-			"size":      meta.Size,
-			"sha256":    meta.SHA256,
-			"chunkSize": chunkSize,
+			"id":             meta.ID,
+			"fileName":       meta.FileName,
+			"size":           meta.Size,
+			"rawSize":        meta.RawSize,
+			"compressedSize": meta.CompressedSize,
+			"compression":    meta.Compression,
+			"sha256":         meta.SHA256,
+			"chunkSize":      chunkSize,
 		})
 		return
 	case "chunk":
@@ -751,6 +942,10 @@ func handleFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		enc := r.URL.Query().Get("enc") == "1"
 		if enc && len(sharedKey) == 0 {
 			http.Error(w, "Shared key not configured", http.StatusBadRequest)
+			return
+		}
+		if err := ensureFilePresent(db, meta); err != nil {
+			http.Error(w, "File is not cached locally", http.StatusServiceUnavailable)
 			return
 		}
 		f, err := os.Open(meta.Path)
@@ -779,6 +974,7 @@ func handleFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		}
 		chunkHash := sha256.Sum256(buf)
 		w.Header().Set("X-Chunk-SHA256", hex.EncodeToString(chunkHash[:]))
+		_ = touchFileAccess(db, meta.ID, &index)
 		if enc {
 			nonce, data, err := encryptJSON(buf)
 			if err != nil {
@@ -820,6 +1016,10 @@ func handleFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 			http.Error(w, "Start out of range", http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
+		if err := ensureFilePresent(db, meta); err != nil {
+			http.Error(w, "File is not cached locally", http.StatusServiceUnavailable)
+			return
+		}
 		available := meta.Size - start
 		if reqSize > available {
 			reqSize = available
@@ -845,9 +1045,16 @@ func handleFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		w.Header().Set("X-Range-Start", strconv.FormatInt(start, 10))
 		w.Header().Set("X-Range-End", strconv.FormatInt(start+int64(len(buf)), 10))
 		w.Header().Set("Content-Type", "application/octet-stream")
+		chunkIndex := int(start / chunkSize)
+		_ = touchFileAccess(db, meta.ID, &chunkIndex)
 		w.Write(buf)
 		return
 	case "download":
+		if err := ensureFilePresent(db, meta); err != nil {
+			http.Error(w, "File is not cached locally", http.StatusServiceUnavailable)
+			return
+		}
+		_ = touchFileAccess(db, meta.ID, nil)
 		http.ServeFile(w, r, meta.Path)
 		return
 	default:
@@ -857,13 +1064,34 @@ func handleFiles(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 }
 
 func getFileMeta(db *sql.DB, fileID string) (*FileMeta, error) {
-	row := db.QueryRow("SELECT id, filename, size, sha256, path FROM files WHERE id = ?", fileID)
-	var id, name, sha, path string
-	var size int64
-	if err := row.Scan(&id, &name, &size, &sha, &path); err != nil {
+	row := db.QueryRow("SELECT id, filename, size, sha256, path, raw_size, compressed_size, compressed_path, compression, is_cached FROM files WHERE id = ?", fileID)
+	var id, name, sha, path, compressedPath, compression string
+	var size, rawSize, compressedSize int64
+	var isCached int
+	if err := row.Scan(&id, &name, &size, &sha, &path, &rawSize, &compressedSize, &compressedPath, &compression, &isCached); err != nil {
 		return nil, err
 	}
-	return &FileMeta{ID: id, FileName: name, Size: size, SHA256: sha, Path: path}, nil
+	if rawSize <= 0 {
+		rawSize = size
+	}
+	if compressedSize <= 0 {
+		compressedSize = size
+	}
+	if strings.TrimSpace(compression) == "" {
+		compression = "none"
+	}
+	return &FileMeta{
+		ID:             id,
+		FileName:       name,
+		Size:           size,
+		RawSize:        rawSize,
+		CompressedSize: compressedSize,
+		Compression:    compression,
+		SHA256:         sha,
+		Path:           path,
+		CompressedPath: compressedPath,
+		IsCached:       isCached == 1,
+	}, nil
 }
 
 func handleExport(w http.ResponseWriter, r *http.Request, db *sql.DB) {
@@ -1001,10 +1229,31 @@ func initDB() *sql.DB {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Reduce SQLITE_BUSY errors under concurrent read/write traffic.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000;"); err != nil {
+		log.Printf("failed to set sqlite busy_timeout: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA journal_mode = WAL;"); err != nil {
+		log.Printf("failed to set sqlite WAL mode: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA synchronous = NORMAL;"); err != nil {
+		log.Printf("failed to set sqlite synchronous mode: %v", err)
+	}
 
 	create := func(query string) {
 		if _, err := db.Exec(query); err != nil {
 			log.Fatal(err)
+		}
+	}
+	bestEffort := func(query string) {
+		if _, err := db.Exec(query); err != nil {
+			msg := strings.ToLower(strings.TrimSpace(err.Error()))
+			if strings.Contains(msg, "duplicate column name") || strings.Contains(msg, "already exists") {
+				return
+			}
+			log.Printf("schema update skipped: %v", err)
 		}
 	}
 
@@ -1033,6 +1282,12 @@ func initDB() *sql.DB {
 		sha256 TEXT,
 		path TEXT
 	);`)
+	bestEffort("ALTER TABLE files ADD COLUMN raw_size INTEGER DEFAULT 0;")
+	bestEffort("ALTER TABLE files ADD COLUMN compressed_size INTEGER DEFAULT 0;")
+	bestEffort("ALTER TABLE files ADD COLUMN compressed_path TEXT DEFAULT '';")
+	bestEffort("ALTER TABLE files ADD COLUMN compression TEXT DEFAULT 'none';")
+	bestEffort("ALTER TABLE files ADD COLUMN last_accessed TEXT DEFAULT '';")
+	bestEffort("ALTER TABLE files ADD COLUMN is_cached INTEGER DEFAULT 1;")
 	create(`CREATE TABLE IF NOT EXISTS join_requests (
 		id TEXT PRIMARY KEY,
 		room_id TEXT,
@@ -1096,6 +1351,39 @@ func initDB() *sql.DB {
 		owner_port INTEGER,
 		updated_at TEXT,
 		PRIMARY KEY (file_id, chunk_index, owner_host, owner_port)
+	);`)
+	create(`CREATE TABLE IF NOT EXISTS storage_chunks (
+		file_id TEXT,
+		chunk_index INTEGER,
+		offset_bytes INTEGER,
+		chunk_size INTEGER,
+		chunk_sha256 TEXT,
+		last_accessed TEXT,
+		is_present INTEGER DEFAULT 1,
+		PRIMARY KEY (file_id, chunk_index)
+	);`)
+	create(`CREATE TABLE IF NOT EXISTS sms_transfers (
+		transfer_id TEXT PRIMARY KEY,
+		file_name TEXT,
+		file_sha256 TEXT,
+		total_parts INTEGER,
+		received_parts INTEGER,
+		encoding TEXT,
+		compression TEXT,
+		status TEXT,
+		source TEXT,
+		target TEXT,
+		output_path TEXT,
+		created_at TEXT,
+		updated_at TEXT
+	);`)
+	create(`CREATE TABLE IF NOT EXISTS sms_parts (
+		transfer_id TEXT,
+		part_index INTEGER,
+		total_parts INTEGER,
+		payload TEXT,
+		received_at TEXT,
+		PRIMARY KEY (transfer_id, part_index)
 	);`)
 
 	return db
@@ -1195,6 +1483,8 @@ func handleUploadPost(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	for i := 0; i < totalLocalChunks; i++ {
 		_ = upsertChunkOwner(db, fileID, i, localHost, localPort)
 	}
+	_ = indexFileChunks(db, fileID, filepath, written, chunkSize)
+	go buildCompressedArtifact(db, fileID, filepath, written)
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Post uploaded successfully"))
@@ -1428,6 +1718,8 @@ func handleUploadFinish(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	for i := 0; i < session.TotalChunk; i++ {
 		_ = upsertChunkOwner(db, fileID, i, localHost, localPort)
 	}
+	_ = indexFileChunks(db, fileID, finalPath, written, chunkSize)
+	go buildCompressedArtifact(db, fileID, finalPath, written)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1613,6 +1905,47 @@ func handleMembership(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	json.NewEncoder(w).Encode(map[string]bool{"approved": exists})
 }
 
+func handleListMembers(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
+		return
+	}
+	roomID := strings.TrimSpace(r.URL.Query().Get("roomId"))
+	if r.Method == http.MethodPost {
+		var req struct {
+			RoomID string `json:"roomId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil && strings.TrimSpace(req.RoomID) != "" {
+			roomID = strings.TrimSpace(req.RoomID)
+		}
+	}
+	if roomID == "" {
+		http.Error(w, "Missing roomId", http.StatusBadRequest)
+		return
+	}
+	rows, err := db.Query("SELECT room_id, student FROM members WHERE room_id = ? ORDER BY student ASC", roomID)
+	if err != nil {
+		http.Error(w, "Failed to fetch members", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	list := make([]Member, 0)
+	for rows.Next() {
+		var m Member
+		if err := rows.Scan(&m.RoomID, &m.Student); err != nil {
+			continue
+		}
+		list = append(list, m)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"roomId":    roomID,
+		"members":   list,
+		"count":     len(list),
+		"updatedAt": time.Now().Format(time.RFC3339),
+	})
+}
+
 func handleRoomStats(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	roomID := r.URL.Query().Get("roomId")
 	var classroomCount int
@@ -1633,6 +1966,84 @@ func handleRoomStats(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		"classroomCount": classroomCount,
 		"memberCount":    memberCount,
 		"pendingCount":   pendingCount,
+	})
+}
+
+func handleDeleteClassroom(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		RoomID string `json:"roomId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	roomID := strings.TrimSpace(req.RoomID)
+	if roomID == "" {
+		http.Error(w, "Missing roomId", http.StatusBadRequest)
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "Failed to start delete transaction", http.StatusInternalServerError)
+		return
+	}
+	rollback := func() {
+		_ = tx.Rollback()
+	}
+
+	if _, err := tx.Exec("DELETE FROM assignment_submissions WHERE code = ?", roomID); err != nil {
+		rollback()
+		http.Error(w, "Failed to delete submissions", http.StatusInternalServerError)
+		return
+	}
+	if _, err := tx.Exec("DELETE FROM assignments WHERE code = ?", roomID); err != nil {
+		rollback()
+		http.Error(w, "Failed to delete assignments", http.StatusInternalServerError)
+		return
+	}
+	if _, err := tx.Exec("DELETE FROM posts WHERE code = ?", roomID); err != nil {
+		rollback()
+		http.Error(w, "Failed to delete posts", http.StatusInternalServerError)
+		return
+	}
+	if _, err := tx.Exec("DELETE FROM announcements WHERE code = ?", roomID); err != nil {
+		rollback()
+		http.Error(w, "Failed to delete announcements", http.StatusInternalServerError)
+		return
+	}
+	if _, err := tx.Exec("DELETE FROM join_requests WHERE room_id = ?", roomID); err != nil {
+		rollback()
+		http.Error(w, "Failed to delete join requests", http.StatusInternalServerError)
+		return
+	}
+	if _, err := tx.Exec("DELETE FROM members WHERE room_id = ?", roomID); err != nil {
+		rollback()
+		http.Error(w, "Failed to delete members", http.StatusInternalServerError)
+		return
+	}
+	if _, err := tx.Exec("DELETE FROM rooms WHERE id = ?", roomID); err != nil {
+		rollback()
+		http.Error(w, "Failed to delete classroom", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "Failed to commit classroom deletion", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"deleted": true,
+		"roomId":  roomID,
 	})
 }
 
@@ -1910,6 +2321,475 @@ func handleChunkOwners(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		"chunkIndex": chunkIndex,
 		"owners":     owners,
 	})
+}
+
+func handleSMSPrepare(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
+		return
+	}
+	var req SMSPrepareRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	var (
+		raw      []byte
+		fileName string
+	)
+	if strings.TrimSpace(req.FileID) != "" {
+		meta, err := getFileMeta(db, strings.TrimSpace(req.FileID))
+		if err != nil {
+			http.Error(w, "Unknown fileId", http.StatusNotFound)
+			return
+		}
+		if err := ensureFilePresent(db, meta); err != nil {
+			http.Error(w, "File not available for SMS preparation", http.StatusServiceUnavailable)
+			return
+		}
+		data, err := os.ReadFile(meta.Path)
+		if err != nil {
+			http.Error(w, "Failed to read file", http.StatusInternalServerError)
+			return
+		}
+		raw = data
+		fileName = meta.FileName
+	} else {
+		text := strings.TrimSpace(req.Text)
+		if text == "" {
+			http.Error(w, "Provide fileId or text", http.StatusBadRequest)
+			return
+		}
+		raw = []byte(text)
+		fileName = strings.TrimSpace(req.FileName)
+		if fileName == "" {
+			fileName = "sms-resource.txt"
+		}
+	}
+	if strings.TrimSpace(req.FileName) != "" {
+		fileName = sanitizeFileName(req.FileName)
+	}
+
+	compressed, compression := raw, "none"
+	if req.Compress || strings.TrimSpace(req.FileID) != "" {
+		var err error
+		compressed, err = compressSMSPayload(raw)
+		if err == nil {
+			compression = "zstd"
+		}
+	}
+	encoding := "base85"
+	if req.UseBase64 {
+		encoding = "base64"
+	}
+	sum := sha256.Sum256(raw)
+	fileSHA := hex.EncodeToString(sum[:])
+	transferID := makeSMSTransferID()
+	messages, err := buildSMSMessages(transferID, fileName, fileSHA, compression, encoding, compressed)
+	if err != nil {
+		http.Error(w, "Failed to build SMS chunks", http.StatusInternalServerError)
+		return
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	_, _ = db.Exec(`INSERT INTO sms_transfers
+		(transfer_id, file_name, file_sha256, total_parts, received_parts, encoding, compression, status, source, target, output_path, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?, 'prepared', ?, ?, '', ?, ?)
+		ON CONFLICT(transfer_id) DO UPDATE SET
+			file_name=excluded.file_name,
+			file_sha256=excluded.file_sha256,
+			total_parts=excluded.total_parts,
+			encoding=excluded.encoding,
+			compression=excluded.compression,
+			status=excluded.status,
+			source=excluded.source,
+			target=excluded.target,
+			updated_at=excluded.updated_at`,
+		transferID, fileName, fileSHA, len(messages)-1, encoding, compression, nodeID, strings.TrimSpace(req.Target), now, now)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(SMSPrepareResponse{
+		TransferID:  transferID,
+		FileName:    fileName,
+		Parts:       len(messages) - 1,
+		Encoding:    encoding,
+		Compression: compression,
+		Messages:    messages,
+	})
+}
+
+func handleSMSIngest(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		From    string `json:"from"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	message := strings.TrimSpace(req.Message)
+	if !strings.HasPrefix(message, smsPrefix) {
+		http.Error(w, "Not a SchoolSync SMS", http.StatusBadRequest)
+		return
+	}
+	body := strings.TrimPrefix(message, smsPrefix)
+	parts := strings.SplitN(body, "|", 2)
+	if len(parts) < 2 {
+		http.Error(w, "Invalid SMS packet", http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	switch strings.TrimSpace(parts[0]) {
+	case "M":
+		metaParts := strings.Split(body, "|")
+		parts = metaParts
+		if len(parts) < 8 {
+			http.Error(w, "Invalid SMS meta packet", http.StatusBadRequest)
+			return
+		}
+		transferID := strings.TrimSpace(parts[1])
+		total, err := strconv.Atoi(strings.TrimSpace(parts[6]))
+		if err != nil || total <= 0 {
+			http.Error(w, "Invalid total parts", http.StatusBadRequest)
+			return
+		}
+		fileNameRaw, err := decodeBase64String(parts[2])
+		if err != nil {
+			http.Error(w, "Invalid fileName encoding", http.StatusBadRequest)
+			return
+		}
+		_, _ = db.Exec(`INSERT INTO sms_transfers
+			(transfer_id, file_name, file_sha256, total_parts, received_parts, encoding, compression, status, source, target, output_path, created_at, updated_at)
+			VALUES (?, ?, ?, ?, 0, ?, ?, 'receiving', ?, ?, '', ?, ?)
+			ON CONFLICT(transfer_id) DO UPDATE SET
+				file_name=excluded.file_name,
+				file_sha256=excluded.file_sha256,
+				total_parts=excluded.total_parts,
+				encoding=excluded.encoding,
+				compression=excluded.compression,
+				status='receiving',
+				source=excluded.source,
+				updated_at=excluded.updated_at`,
+			transferID, sanitizeFileName(fileNameRaw), strings.TrimSpace(parts[3]), total, strings.TrimSpace(parts[5]), strings.TrimSpace(parts[4]), strings.TrimSpace(req.From), nodeID, now, now)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "transferId": transferID, "packet": "meta"})
+		return
+	case "D":
+		dataParts := strings.SplitN(body, "|", 6)
+		parts = dataParts
+		if len(parts) < 6 {
+			http.Error(w, "Invalid SMS data packet", http.StatusBadRequest)
+			return
+		}
+		transferID := strings.TrimSpace(parts[1])
+		partIndex, err := strconv.Atoi(strings.TrimSpace(parts[2]))
+		if err != nil || partIndex <= 0 {
+			http.Error(w, "Invalid part index", http.StatusBadRequest)
+			return
+		}
+		total, err := strconv.Atoi(strings.TrimSpace(parts[3]))
+		if err != nil || total <= 0 {
+			http.Error(w, "Invalid total", http.StatusBadRequest)
+			return
+		}
+		payload := strings.TrimSpace(parts[5])
+		_, _ = db.Exec(`INSERT INTO sms_parts (transfer_id, part_index, total_parts, payload, received_at)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(transfer_id, part_index) DO UPDATE SET
+				payload=excluded.payload,
+				received_at=excluded.received_at`,
+			transferID, partIndex, total, payload, now)
+		_, _ = db.Exec(`INSERT OR IGNORE INTO sms_transfers
+			(transfer_id, file_name, file_sha256, total_parts, received_parts, encoding, compression, status, source, target, output_path, created_at, updated_at)
+			VALUES (?, '', '', ?, 0, ?, 'unknown', 'receiving', ?, ?, '', ?, ?)`,
+			transferID, total, strings.TrimSpace(parts[4]), strings.TrimSpace(req.From), nodeID, now, now)
+
+		var received int
+		_ = db.QueryRow("SELECT COUNT(1) FROM sms_parts WHERE transfer_id = ?", transferID).Scan(&received)
+		status := "receiving"
+		if received >= total {
+			status = "ready"
+		}
+		_, _ = db.Exec(`UPDATE sms_transfers
+			SET total_parts = CASE WHEN total_parts <= 0 THEN ? ELSE total_parts END,
+				received_parts = ?,
+				status = ?,
+				updated_at = ?
+			WHERE transfer_id = ?`, total, received, status, now, transferID)
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":            true,
+			"transferId":    transferID,
+			"partIndex":     partIndex,
+			"receivedParts": received,
+			"totalParts":    total,
+			"status":        status,
+		})
+		return
+	default:
+		http.Error(w, "Unknown SMS packet type", http.StatusBadRequest)
+		return
+	}
+}
+
+func handleSMSStatus(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
+		return
+	}
+	transferID := strings.TrimSpace(r.URL.Query().Get("transferId"))
+	if transferID == "" {
+		http.Error(w, "Missing transferId", http.StatusBadRequest)
+		return
+	}
+	var row struct {
+		TransferID    string `json:"transferId"`
+		FileName      string `json:"fileName"`
+		FileSHA256    string `json:"fileSha256"`
+		TotalParts    int    `json:"totalParts"`
+		ReceivedParts int    `json:"receivedParts"`
+		Encoding      string `json:"encoding"`
+		Compression   string `json:"compression"`
+		Status        string `json:"status"`
+		OutputPath    string `json:"outputPath"`
+		UpdatedAt     string `json:"updatedAt"`
+	}
+	err := db.QueryRow(`SELECT transfer_id, file_name, file_sha256, total_parts, received_parts, encoding, compression, status, output_path, updated_at
+		FROM sms_transfers WHERE transfer_id = ?`, transferID).
+		Scan(&row.TransferID, &row.FileName, &row.FileSHA256, &row.TotalParts, &row.ReceivedParts, &row.Encoding, &row.Compression, &row.Status, &row.OutputPath, &row.UpdatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			http.Error(w, "Transfer not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Failed to query transfer", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(row)
+}
+
+func handleSMSReassemble(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		TransferID string `json:"transferId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	transferID := strings.TrimSpace(req.TransferID)
+	if transferID == "" {
+		http.Error(w, "Missing transferId", http.StatusBadRequest)
+		return
+	}
+
+	var fileName, fileSHA, encoding, compression, status string
+	var totalParts int
+	err := db.QueryRow(`SELECT file_name, file_sha256, total_parts, encoding, compression, status
+		FROM sms_transfers WHERE transfer_id = ?`, transferID).
+		Scan(&fileName, &fileSHA, &totalParts, &encoding, &compression, &status)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			http.Error(w, "Transfer not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Failed to query transfer", http.StatusInternalServerError)
+		return
+	}
+	if totalParts <= 0 {
+		http.Error(w, "Transfer metadata incomplete", http.StatusBadRequest)
+		return
+	}
+
+	rows, err := db.Query(`SELECT part_index, payload FROM sms_parts
+		WHERE transfer_id = ?
+		ORDER BY part_index ASC`, transferID)
+	if err != nil {
+		http.Error(w, "Failed to query parts", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	chunks := make([][]byte, 0, totalParts)
+	for rows.Next() {
+		var partIndex int
+		var payload string
+		if err := rows.Scan(&partIndex, &payload); err != nil {
+			continue
+		}
+		raw, err := decodeSMSChunkPayload(payload, encoding)
+		if err != nil {
+			http.Error(w, "Failed to decode part payload", http.StatusBadRequest)
+			return
+		}
+		chunks = append(chunks, raw)
+	}
+	if len(chunks) != totalParts {
+		http.Error(w, "Transfer is incomplete", http.StatusConflict)
+		return
+	}
+
+	joined := bytes.Join(chunks, nil)
+	finalBytes := joined
+	if strings.EqualFold(strings.TrimSpace(compression), "zstd") {
+		decoded, err := decompressSMSPayload(joined)
+		if err != nil {
+			http.Error(w, "Failed to decompress transfer", http.StatusBadRequest)
+			return
+		}
+		finalBytes = decoded
+	}
+	sum := sha256.Sum256(finalBytes)
+	actualSHA := hex.EncodeToString(sum[:])
+	if strings.TrimSpace(fileSHA) != "" && !strings.EqualFold(fileSHA, actualSHA) {
+		http.Error(w, "Integrity check failed", http.StatusBadRequest)
+		return
+	}
+
+	if fileName == "" {
+		fileName = "sms-resource.bin"
+	}
+	outName := fmt.Sprintf("sms_%s_%s", transferID, sanitizeFileName(fileName))
+	outPath := filepath.Join(uploadDir, outName)
+	if err := os.WriteFile(outPath, finalBytes, 0o600); err != nil {
+		http.Error(w, "Failed to write reconstructed file", http.StatusInternalServerError)
+		return
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	_, _ = db.Exec(`UPDATE sms_transfers
+		SET received_parts = ?, status = 'completed', output_path = ?, updated_at = ?
+		WHERE transfer_id = ?`, totalParts, outPath, now, transferID)
+	_, _ = db.Exec(`INSERT OR IGNORE INTO files (id, filename, size, sha256, path)
+		VALUES (?, ?, ?, ?, ?)`, actualSHA, fileName, len(finalBytes), actualSHA, outPath)
+	_ = indexFileChunks(db, actualSHA, outPath, int64(len(finalBytes)), chunkSize)
+	go buildCompressedArtifact(db, actualSHA, outPath, int64(len(finalBytes)))
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":      "Resource reassembled",
+		"transferId":   transferID,
+		"fileId":       actualSHA,
+		"fileName":     fileName,
+		"size":         len(finalBytes),
+		"outputPath":   outPath,
+		"statusBefore": status,
+	})
+}
+
+func makeSMSTransferID() string {
+	raw := makeID()
+	if len(raw) <= 12 {
+		return raw
+	}
+	return raw[:12]
+}
+
+func buildSMSMessages(transferID, fileName, fileSHA, compression, encoding string, payload []byte) ([]string, error) {
+	if strings.TrimSpace(transferID) == "" || len(payload) == 0 {
+		return nil, fmt.Errorf("invalid sms build input")
+	}
+	if encoding != "base85" && encoding != "base64" {
+		return nil, fmt.Errorf("unsupported encoding")
+	}
+	if len(fileName) > 32 {
+		fileName = fileName[:32]
+	}
+	total := int((len(payload) + smsRawChunkSize - 1) / smsRawChunkSize)
+	if total <= 0 {
+		total = 1
+	}
+
+	nameB64 := base64.StdEncoding.EncodeToString([]byte(fileName))
+	meta := fmt.Sprintf("%sM|%s|%s|%s|%s|%s|%d",
+		smsPrefix, transferID, nameB64, fileSHA, compression, encoding, total)
+	if len(meta) > 160 {
+		return nil, fmt.Errorf("sms meta exceeds 160 chars")
+	}
+	out := []string{meta}
+
+	for i := 0; i < total; i++ {
+		start := i * smsRawChunkSize
+		end := start + smsRawChunkSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+		part := payload[start:end]
+		encoded := encodeSMSChunkPayload(part, encoding)
+		if len(encoded) > smsPartTextLimit {
+			return nil, fmt.Errorf("encoded SMS chunk too large: part=%d chars=%d", i+1, len(encoded))
+		}
+		msg := fmt.Sprintf("%sD|%s|%d|%d|%s|%s", smsPrefix, transferID, i+1, total, encoding, encoded)
+		if len(msg) > 160 {
+			return nil, fmt.Errorf("sms exceeds 160 chars at part=%d", i+1)
+		}
+		out = append(out, msg)
+	}
+	return out, nil
+}
+
+func encodeSMSChunkPayload(raw []byte, encoding string) string {
+	if encoding == "base64" {
+		return base64.StdEncoding.EncodeToString(raw)
+	}
+	dst := make([]byte, ascii85.MaxEncodedLen(len(raw)))
+	n := ascii85.Encode(dst, raw)
+	return string(dst[:n])
+}
+
+func decodeSMSChunkPayload(encoded, encoding string) ([]byte, error) {
+	if encoding == "base64" {
+		return base64.StdEncoding.DecodeString(encoded)
+	}
+	dst := make([]byte, len(encoded))
+	n, _, err := ascii85.Decode(dst, []byte(encoded), true)
+	if err != nil {
+		return nil, err
+	}
+	return dst[:n], nil
+}
+
+func decodeBase64String(raw string) (string, error) {
+	b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw))
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func compressSMSPayload(raw []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw, err := zstd.NewWriter(&buf, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := zw.Write(raw); err != nil {
+		_ = zw.Close()
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func decompressSMSPayload(raw []byte) ([]byte, error) {
+	zr, err := zstd.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	return io.ReadAll(zr)
 }
 
 func upsertChunkOwner(db *sql.DB, fileID string, chunkIndex int, host string, port int) error {
@@ -2242,6 +3122,7 @@ func syncFilesFromPeer(db *sql.DB, base string, files []FileMeta) {
 		db.Exec("INSERT OR IGNORE INTO files (id, filename, size, sha256, path) VALUES (?, ?, ?, ?, ?)",
 			f.ID, f.FileName, f.Size, f.SHA256, localPath)
 		mu.Unlock()
+		_ = indexFileChunks(db, f.ID, localPath, f.Size, chunkSize)
 	}
 }
 
@@ -2597,6 +3478,231 @@ func revalidateCompletedChunks(db *sql.DB, f *os.File, fileID string, man fileMa
 		}
 	}
 	return updateCompletedChunks(db, fileID)
+}
+
+func startStorageJanitor(db *sql.DB) {
+	runStorageJanitor(db)
+	ticker := time.NewTicker(janitorInt)
+	defer ticker.Stop()
+	for range ticker.C {
+		runStorageJanitor(db)
+	}
+}
+
+func runStorageJanitor(db *sql.DB) {
+	used, budget := currentStorageUsage()
+	if budget <= 0 || used <= 0 {
+		return
+	}
+	usagePct := int((used * 100) / budget)
+	if usagePct < storageSoftLimitPct {
+		return
+	}
+
+	for usagePct > 80 {
+		var fileID, path, compressedPath string
+		err := db.QueryRow(`SELECT id, path, compressed_path FROM files
+			WHERE is_cached = 1 AND TRIM(path) <> ''
+			ORDER BY CASE WHEN TRIM(last_accessed) = '' THEN '1970-01-01T00:00:00Z' ELSE last_accessed END ASC
+			LIMIT 1`).Scan(&fileID, &path, &compressedPath)
+		if err != nil {
+			return
+		}
+
+		if strings.TrimSpace(path) != "" {
+			_ = os.Remove(path)
+		}
+		if strings.TrimSpace(compressedPath) != "" {
+			_ = os.Remove(compressedPath)
+		}
+		now := time.Now().Format(time.RFC3339)
+		_, _ = db.Exec("UPDATE files SET path = '', compressed_path = '', is_cached = 0, last_accessed = ? WHERE id = ?", now, fileID)
+		_, _ = db.Exec("UPDATE storage_chunks SET is_present = 0, last_accessed = ? WHERE file_id = ?", now, fileID)
+
+		used, budget = currentStorageUsage()
+		if budget <= 0 || used <= 0 {
+			return
+		}
+		usagePct = int((used * 100) / budget)
+	}
+}
+
+func currentStorageUsage() (int64, int64) {
+	budget := int64(5 * 1024 * 1024 * 1024) // 5GB default device budget
+	if raw := strings.TrimSpace(os.Getenv("RDE_STORAGE_BUDGET_BYTES")); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+			budget = parsed
+		}
+	}
+
+	var used int64
+	_ = filepath.Walk(uploadDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		used += info.Size()
+		return nil
+	})
+	return used, budget
+}
+
+func ensureFilePresent(db *sql.DB, meta *FileMeta) error {
+	if meta == nil {
+		return fmt.Errorf("missing file metadata")
+	}
+	if strings.TrimSpace(meta.Path) != "" {
+		if _, err := os.Stat(meta.Path); err == nil {
+			return nil
+		}
+	}
+	localPath, err := downloadFileChunks(db, "", *meta)
+	if err != nil {
+		return err
+	}
+	now := time.Now().Format(time.RFC3339)
+	_, _ = db.Exec("UPDATE files SET path = ?, is_cached = 1, last_accessed = ? WHERE id = ?", localPath, now, meta.ID)
+	meta.Path = localPath
+	meta.IsCached = true
+	if info, err := os.Stat(localPath); err == nil {
+		meta.Size = info.Size()
+	}
+	_ = indexFileChunks(db, meta.ID, localPath, meta.Size, chunkSize)
+	return nil
+}
+
+func touchFileAccess(db *sql.DB, fileID string, chunkIndex *int) error {
+	now := time.Now().Format(time.RFC3339)
+	if _, err := db.Exec("UPDATE files SET last_accessed = ? WHERE id = ?", now, fileID); err != nil {
+		return err
+	}
+	if chunkIndex != nil && *chunkIndex >= 0 {
+		_, _ = db.Exec("UPDATE storage_chunks SET last_accessed = ? WHERE file_id = ? AND chunk_index = ?", now, fileID, *chunkIndex)
+	}
+	return nil
+}
+
+func indexFileChunks(db *sql.DB, fileID, path string, rawSize int64, chunkBytes int64) error {
+	fileID = strings.TrimSpace(fileID)
+	path = strings.TrimSpace(path)
+	if fileID == "" || path == "" {
+		return fmt.Errorf("invalid indexing input")
+	}
+	if chunkBytes <= 0 {
+		chunkBytes = chunkSize
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	now := time.Now().Format(time.RFC3339)
+	offset := int64(0)
+	index := 0
+	buf := make([]byte, chunkBytes)
+	for {
+		n, readErr := io.ReadFull(f, buf)
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil && readErr != io.ErrUnexpectedEOF {
+			return readErr
+		}
+		chunk := buf[:n]
+		sum := sha256.Sum256(chunk)
+		_, err := db.Exec(`INSERT INTO storage_chunks
+			(file_id, chunk_index, offset_bytes, chunk_size, chunk_sha256, last_accessed, is_present)
+			VALUES (?, ?, ?, ?, ?, ?, 1)
+			ON CONFLICT(file_id, chunk_index) DO UPDATE SET
+				offset_bytes=excluded.offset_bytes,
+				chunk_size=excluded.chunk_size,
+				chunk_sha256=excluded.chunk_sha256,
+				last_accessed=excluded.last_accessed,
+				is_present=1`,
+			fileID, index, offset, n, hex.EncodeToString(sum[:]), now)
+		if err != nil {
+			return err
+		}
+		offset += int64(n)
+		index++
+		if readErr == io.ErrUnexpectedEOF {
+			break
+		}
+	}
+	if rawSize <= 0 {
+		rawSize = offset
+	}
+	_, _ = db.Exec(`UPDATE files
+		SET size = CASE WHEN size <= 0 THEN ? ELSE size END,
+			raw_size = CASE WHEN raw_size <= 0 THEN ? ELSE raw_size END,
+			compressed_size = CASE WHEN compressed_size <= 0 THEN ? ELSE compressed_size END,
+			compression = CASE WHEN TRIM(compression) = '' THEN 'none' ELSE compression END,
+			last_accessed = ?,
+			is_cached = 1
+		WHERE id = ?`, rawSize, rawSize, rawSize, now, fileID)
+	return nil
+}
+
+func buildCompressedArtifact(db *sql.DB, fileID, srcPath string, rawSize int64) {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("RDE_ENABLE_STORAGE_COMPRESSION")), "false") {
+		return
+	}
+	if strings.TrimSpace(srcPath) == "" || strings.TrimSpace(fileID) == "" {
+		return
+	}
+	if err := os.MkdirAll(compressedDir, os.ModePerm); err != nil {
+		return
+	}
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return
+	}
+	defer src.Close()
+
+	dstPath := filepath.Join(compressedDir, fileID+".sz")
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		return
+	}
+	zw, err := zstd.NewWriter(dst, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
+	if err != nil {
+		_ = dst.Close()
+		return
+	}
+	if _, err := io.Copy(zw, src); err != nil {
+		_ = zw.Close()
+		_ = dst.Close()
+		_ = os.Remove(dstPath)
+		return
+	}
+	if err := zw.Close(); err != nil {
+		_ = dst.Close()
+		_ = os.Remove(dstPath)
+		return
+	}
+	if err := dst.Close(); err != nil {
+		_ = os.Remove(dstPath)
+		return
+	}
+
+	info, err := os.Stat(dstPath)
+	if err != nil {
+		return
+	}
+	now := time.Now().Format(time.RFC3339)
+	if rawSize <= 0 {
+		if srcInfo, err := os.Stat(srcPath); err == nil {
+			rawSize = srcInfo.Size()
+		}
+	}
+	if rawSize > 0 && info.Size() >= rawSize {
+		_ = os.Remove(dstPath)
+		_, _ = db.Exec(`UPDATE files SET raw_size = ?, compressed_size = ?, compressed_path = '', compression = 'none', last_accessed = ? WHERE id = ?`,
+			rawSize, rawSize, now, fileID)
+		return
+	}
+	_, _ = db.Exec(`UPDATE files SET raw_size = ?, compressed_size = ?, compressed_path = ?, compression = 'sz-zstd', last_accessed = ? WHERE id = ?`,
+		rawSize, info.Size(), dstPath, now, fileID)
 }
 
 func sanitizeFileName(name string) string {

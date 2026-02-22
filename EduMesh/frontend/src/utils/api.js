@@ -2,17 +2,22 @@ function resolveApiBase() {
   if (process.env.REACT_APP_API_BASE) {
     return process.env.REACT_APP_API_BASE;
   }
+  const backendPort = process.env.REACT_APP_BACKEND_PORT || "8080";
   if (typeof window === "undefined") {
-    return "http://localhost:8080";
+    return `http://localhost:${backendPort}`;
   }
   const { protocol, hostname } = window.location;
   const safeHost = hostname || "localhost";
-  // In dev we serve UI on :3000 and backend on :8080. On mobile/LAN,
-  // hostname is the laptop IP, not localhost.
+  // In dev we serve UI on :3000 and backend on configured backend port.
+  // On mobile/LAN, hostname is the laptop IP, not localhost.
   if (window.location.port === "3000") {
-    return `${protocol}//${safeHost}:8080`;
+    return `${protocol}//${safeHost}:${backendPort}`;
   }
-  return `${protocol}//${safeHost}:8080`;
+  // If UI is served from backend itself, use same origin/port.
+  if (window.location.port) {
+    return `${protocol}//${safeHost}:${window.location.port}`;
+  }
+  return `${protocol}//${safeHost}:${backendPort}`;
 }
 
 const API_BASE = resolveApiBase();
@@ -80,8 +85,8 @@ export async function addUser(uname) {
 }
 
 // Create room
-export async function createRoom({ title, teacher, description }) {
-  const id = makeId();
+export async function createRoom({ title, teacher, description, manualId = "" }) {
+  const id = String(manualId || "").trim() || makeId();
   await requestJson("/join_room", "POST", {
     id,
     title,
@@ -182,6 +187,47 @@ export async function getMyRooms(uname) {
   return await response.json();
 }
 
+export async function listMembers(roomId) {
+  const id = String(roomId || "").trim();
+  if (!id) throw new Error("roomId is required");
+  const response = await fetch(
+    `${API_BASE}/members/list?roomId=${encodeURIComponent(id)}`
+  );
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return await response.json();
+}
+
+export async function discoverClassrooms() {
+  const localRooms = await getMyRooms().catch(() => []);
+  const peers = await getPeers().catch(() => []);
+  const byId = new Map();
+  for (const room of Array.isArray(localRooms) ? localRooms : []) {
+    if (!room?.id) continue;
+    byId.set(room.id, room);
+  }
+  for (const peer of Array.isArray(peers) ? peers : []) {
+    const host = String(peer?.host || peer?.ip || "").trim();
+    const port = Number(peer?.port || 8080);
+    if (!host || !port) continue;
+    try {
+      const response = await fetch(`http://${host}:${port}/roomsof`);
+      if (!response.ok) continue;
+      const rooms = await response.json();
+      for (const room of Array.isArray(rooms) ? rooms : []) {
+        if (!room?.id) continue;
+        if (!byId.has(room.id)) {
+          byId.set(room.id, room);
+        }
+      }
+    } catch {
+      // ignore unreachable peer
+    }
+  }
+  return Array.from(byId.values());
+}
+
 // Get room details
 export async function getRoomDetails(code) {
   const response = await fetch(
@@ -193,6 +239,14 @@ export async function getRoomDetails(code) {
 
 export function getBase() {
   return API_BASE;
+}
+
+export async function getLocalNetworkInfo() {
+  const response = await fetch(`${API_BASE}/network/info`);
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return await response.json();
 }
 
 export async function startViralShare({
@@ -209,6 +263,22 @@ export async function startViralShare({
     artifactPath,
     enableBluetoothFallback,
   });
+}
+
+export async function uploadViralArtifact(file) {
+  if (!file) {
+    throw new Error("Artifact file is required");
+  }
+  const formData = new FormData();
+  formData.append("artifact", file);
+  const response = await fetch(`${API_BASE}/vcd/upload-artifact`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    throw new Error((await response.text()) || "Artifact upload failed");
+  }
+  return response.json().catch(() => ({}));
 }
 
 export async function getViralShareStatus() {
@@ -250,6 +320,12 @@ export async function getRoomStats(roomId = "") {
     throw new Error(await response.text());
   }
   return await response.json();
+}
+
+export async function deleteClassroom(roomId) {
+  const id = String(roomId || "").trim();
+  if (!id) throw new Error("Room ID is required");
+  return await requestJson("/classroom/delete", "POST", { roomId: id });
 }
 
 export async function createAssignment({
@@ -788,7 +864,42 @@ export async function downloadFileChunked({
         const expected = (resp.headers.get("X-Chunk-SHA256") || "")
           .trim()
           .toLowerCase();
-        const buffer = await resp.arrayBuffer();
+        let buffer;
+        if (resp.body && typeof resp.body.getReader === "function") {
+          const reader = resp.body.getReader();
+          const parts = [];
+          let received = 0;
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (!value) continue;
+            parts.push(value);
+            received += value.byteLength;
+            onProgress?.({
+              type: "download",
+              loadedBytes: Math.min(fileSize, loadedBytes + received),
+              totalBytes: fileSize || loadedBytes + received,
+              chunkIndex: status.ranges.length,
+              totalChunks: virtualTotalChunks,
+              percent: Math.round(
+                (Math.min(fileSize, loadedBytes + received) / Math.max(fileSize || loadedBytes + received, 1)) * 100
+              ),
+              resumedChunks,
+              speedKbps: Math.round(speedKbps),
+              activeChunkSize,
+              chunkStatus: buildChunkStatusSnapshot(status, virtualTotalChunks),
+            });
+          }
+          const merged = new Uint8Array(received);
+          let cursor = 0;
+          for (const part of parts) {
+            merged.set(part, cursor);
+            cursor += part.byteLength;
+          }
+          buffer = merged.buffer;
+        } else {
+          buffer = await resp.arrayBuffer();
+        }
         const actual = await sha256HexFromBuffer(buffer);
         const verifyEnabled = Boolean(actual);
         if (verifyEnabled && expected && expected !== actual) {
@@ -886,15 +997,25 @@ export async function downloadFileChunked({
 
   const downloadName = manifest.fileName || `file-${fileId}`;
   const href = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = href;
-  anchor.download = downloadName;
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(href);
+  try {
+    const anchor = document.createElement("a");
+    anchor.href = href;
+    anchor.download = downloadName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } catch {
+    // UI provides a manual fallback link using the same blob URL.
+  }
   clearDownloadStatus(fileId);
   await idbDeletePrefix(db, `${fileId}:`).catch(() => {});
+  setTimeout(() => {
+    try {
+      URL.revokeObjectURL(href);
+    } catch {
+      // ignore
+    }
+  }, 2 * 60 * 1000);
   return {
     fileId,
     fileName: downloadName,
@@ -902,5 +1023,6 @@ export async function downloadFileChunked({
     resumedChunks,
     speedKbps: Math.round(speedKbps),
     activeChunkSize,
+    downloadHref: href,
   };
 }

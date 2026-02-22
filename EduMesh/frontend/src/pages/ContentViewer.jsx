@@ -17,10 +17,12 @@ const ContentViewer = () => {
   const [uploadStatus, setUploadStatus] = useState("");
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadChunkState, setUploadChunkState] = useState("");
+  const [uploadBusy, setUploadBusy] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadState, setDownloadState] = useState("Discovery in progress...");
   const [activeSource, setActiveSource] = useState("");
   const [downloadResumeInfo, setDownloadResumeInfo] = useState("");
+  const [manualDownload, setManualDownload] = useState(null);
 
   const resolveViewUrl = (fileUrl) => {
     if (!fileUrl) return "";
@@ -45,6 +47,14 @@ const ContentViewer = () => {
     load();
   }, [classroomId]);
 
+  useEffect(() => {
+    return () => {
+      if (manualDownload?.href) {
+        URL.revokeObjectURL(manualDownload.href);
+      }
+    };
+  }, [manualDownload]);
+
   const reloadPosts = async () => {
     if (!classroomId) return;
     try {
@@ -66,7 +76,9 @@ const ContentViewer = () => {
       setUploadStatus("Add content text and choose a file.");
       return;
     }
+    if (uploadBusy) return;
     try {
+      setUploadBusy(true);
       setUploadProgress(0);
       setUploadChunkState("Preparing chunks and checksums...");
       await uploadPostChunked({
@@ -106,11 +118,21 @@ const ContentViewer = () => {
       await reloadPosts();
     } catch (err) {
       setUploadStatus(err.message || "Upload failed.");
+    } finally {
+      setUploadBusy(false);
     }
   };
 
   const handleChunkDownload = async (post) => {
     if (!post?.fileUrl) return;
+    if (!classroomId) {
+      setDownloadState("Join a classroom first.");
+      return;
+    }
+    if (manualDownload?.href) {
+      URL.revokeObjectURL(manualDownload.href);
+    }
+    setManualDownload(null);
     setDownloadProgress(0);
     setDownloadState("Fetching manifest from peers...");
     setActiveSource("");
@@ -158,6 +180,12 @@ const ContentViewer = () => {
       });
       setDownloadProgress(100);
       setDownloadState("Download complete and checksum verified.");
+      if (result?.downloadHref) {
+        setManualDownload({
+          href: result.downloadHref,
+          name: result.fileName || "download.bin",
+        });
+      }
       if (result?.resumedChunks > 0) {
         setDownloadResumeInfo(
           `Resume completed: ${result.resumedChunks} chunks were recovered from previous download`
@@ -185,6 +213,13 @@ const ContentViewer = () => {
         </div>
         <div className="muted">{downloadState}</div>
         {downloadResumeInfo && <div className="muted">{downloadResumeInfo}</div>}
+        {manualDownload?.href && (
+          <div className="muted">
+            If file did not auto-save on mobile, tap:
+            {" "}
+            <a href={manualDownload.href} download={manualDownload.name}>Save File</a>
+          </div>
+        )}
         <div className="muted">
           {activeSource ? `Active source: ${activeSource}` : "Discovery in progress..."}
         </div>
@@ -207,8 +242,8 @@ const ContentViewer = () => {
               type="file"
               onChange={(e) => setFile(e.target.files?.[0] || null)}
             />
-            <button type="submit" className="btn primary">
-              Upload File
+            <button type="submit" className="btn primary" disabled={uploadBusy}>
+              {uploadBusy ? "Uploading..." : "Upload File"}
             </button>
             <div className="progress">
               <div className="progress-bar" style={{ width: `${uploadProgress}%` }} />
@@ -235,6 +270,8 @@ const ContentViewer = () => {
                   <a
                     className="btn"
                     href={resolveViewUrl(p.fileUrl)}
+                    target="_blank"
+                    rel="noreferrer"
                   >
                     View
                   </a>

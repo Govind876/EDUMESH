@@ -1,4 +1,4 @@
-import { Route, Routes, BrowserRouter, Navigate } from "react-router-dom";
+import { Route, Routes, BrowserRouter, Navigate, useLocation } from "react-router-dom";
 import { ProfileProvider } from "./context/profile.context";
 import { AppProvider, useApp } from "./context/app.context";
 import Splash from "./pages/Splash";
@@ -10,7 +10,10 @@ import Assignments from "./pages/Assignments";
 
 const RequireRole = ({ children }) => {
   const { role } = useApp();
-  if (!role) return <Navigate to="/role" replace />;
+  const location = useLocation();
+  if (!role) {
+    return <Navigate to="/role" replace state={{ next: location.pathname + location.search }} />;
+  }
   return children;
 };
 

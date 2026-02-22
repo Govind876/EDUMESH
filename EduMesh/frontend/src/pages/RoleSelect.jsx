@@ -1,10 +1,11 @@
 import React, { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useProfile } from "../context/profile.context";
 import { useApp } from "../context/app.context";
 
 const RoleSelect = () => {
   const navigate = useNavigate();
+  const location = useLocation();
   const { signIn } = useProfile();
   const { setRole } = useApp();
   const [name, setName] = useState("");
@@ -13,7 +14,8 @@ const RoleSelect = () => {
     const finalName = name.trim() || (role === "teacher" ? "Teacher" : "Student");
     signIn(finalName);
     setRole(role);
-    navigate("/discover");
+    const next = location.state?.next;
+    navigate(typeof next === "string" && next.trim() ? next : "/discover");
   };
 
   return (
